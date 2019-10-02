@@ -492,6 +492,8 @@ int HWCDisplay::Init() {
   DisplayError error = kErrorNone;
 
   HWCDebugHandler::Get()->GetProperty(ENABLE_NULL_DISPLAY_PROP, &null_display_mode_);
+  HWCDebugHandler::Get()->GetProperty(ENABLE_SKIP_BOTTOM_SOLID_LAYER,
+                                                   &enable_skip_bottom_solid_layer_);
 
   if (null_display_mode_) {
     DisplayNull *disp_null = new DisplayNull();
@@ -606,6 +608,9 @@ int HWCDisplay::Deinit() {
     delete hwc_layer;
   }
 
+  // Close fbt release fence.
+  close(fbt_release_fence_);
+
   if (color_mode_) {
     color_mode_->DeInit();
     delete color_mode_;
@@ -672,6 +677,7 @@ void HWCDisplay::BuildLayerStack() {
   display_rect_ = LayerRect();
   metadata_refresh_rate_ = 0;
   layer_stack_.flags.animating = animating_;
+  bool zero_solid_layer_at_bottom = true;
 
   // Add one layer for fb target
   // TODO(user): Add blit target layers
@@ -729,14 +735,6 @@ void HWCDisplay::BuildLayerStack() {
       layer_stack_.flags.single_buffered_layer_present = true;
     }
 
-    if (hwc_layer->GetClientRequestedCompositionType() == HWC2::Composition::Cursor) {
-      // Currently we support only one HWCursor & only at top most z-order
-      if ((*layer_set_.rbegin())->GetId() == hwc_layer->GetId()) {
-        layer->flags.cursor = true;
-        layer_stack_.flags.cursor_present = true;
-      }
-    }
-
     bool hdr_layer = layer->input_buffer.color_metadata.colorPrimaries == ColorPrimaries_BT2020 &&
                      (layer->input_buffer.color_metadata.transfer == Transfer_SMPTE_ST2084 ||
                      layer->input_buffer.color_metadata.transfer == Transfer_HLG);
@@ -749,6 +747,15 @@ void HWCDisplay::BuildLayerStack() {
     if (hwc_layer->IsNonIntegralSourceCrop() && !is_secure && !hdr_layer &&
         !layer->flags.single_buffer && !layer->flags.solid_fill) {
       layer->flags.skip = true;
+    }
+
+    if (!layer->flags.skip &&
+        (hwc_layer->GetClientRequestedCompositionType() == HWC2::Composition::Cursor)) {
+      // Currently we support only one HWCursor & only at top most z-order
+      if ((*layer_set_.rbegin())->GetId() == hwc_layer->GetId()) {
+        layer->flags.cursor = true;
+        layer_stack_.flags.cursor_present = true;
+      }
     }
 
     if (layer->flags.skip) {
@@ -778,6 +785,16 @@ void HWCDisplay::BuildLayerStack() {
       layer->src_rect.bottom = layer_buffer->height;
     }
 
+    // skip if solid layers are at the bottom and same as border color
+    if (enable_skip_bottom_solid_layer_ && zero_solid_layer_at_bottom) {
+      if (layer->flags.solid_fill && !(layer->solid_fill_color & 0xFFFFFF)) {
+        layer->composition = kCompositionSDE;
+        continue;
+      } else {
+        zero_solid_layer_at_bottom = false;
+      }
+    }
+
     if (hwc_layer->HasMetaDataRefreshRate() && layer->frame_rate > metadata_refresh_rate_) {
       metadata_refresh_rate_ = SanitizeRefreshRate(layer->frame_rate);
     }
@@ -790,11 +807,15 @@ void HWCDisplay::BuildLayerStack() {
       layer->flags.updating = IsLayerUpdating(hwc_layer);
     }
 
+    layer_stack_.flags.mask_present |= layer->input_buffer.flags.mask_layer;
+
     layer_stack_.layers.push_back(layer);
   }
 
   // TODO(user): Set correctly when SDM supports geometry_changes as bitmask
-  layer_stack_.flags.geometry_changed = UINT32(geometry_changes_ > 0);
+  layer_stack_.flags.geometry_changed = UINT32((geometry_changes_ ||
+                                                geometry_changes_on_doze_suspend_) > 0);
+  geometry_changes_on_doze_suspend_ = GeometryChanges::kNone;
   // Append client target to the layer stack
   Layer *sdm_client_target = client_target_->GetSDMLayer();
   sdm_client_target->flags.updating = IsLayerUpdating(client_target_);
@@ -1131,7 +1152,12 @@ HWC2::Error HWCDisplay::GetActiveConfig(hwc2_config_t *out_config) {
     return HWC2::Error::BadDisplay;
   }
 
-  GetActiveDisplayConfig(out_config);
+  if (pending_config_) {
+    *out_config = pending_config_index_;
+  } else {
+    GetActiveDisplayConfig(out_config);
+  }
+
   if (*out_config < hwc_config_map_.size()) {
     *out_config = hwc_config_map_.at(*out_config);
   }
@@ -1168,11 +1194,21 @@ HWC2::Error HWCDisplay::SetClientTarget(buffer_handle_t target, int32_t acquire_
 }
 
 HWC2::Error HWCDisplay::SetActiveConfig(hwc2_config_t config) {
-  if (SetActiveDisplayConfig(config) != kErrorNone) {
-    return HWC2::Error::BadConfig;
+  hwc2_config_t current_config = 0;
+  GetActiveConfig(&current_config);
+  if (current_config == config) {
+    return HWC2::Error::None;
   }
 
+  // Store config index to be applied upon refresh.
+  pending_config_ = true;
+  pending_config_index_ = config;
+
   validated_ = false;
+
+  // Trigger refresh. This config gets applied on next commit.
+  callbacks_->Refresh(id_);
+
   return HWC2::Error::None;
 }
 
@@ -1273,6 +1309,7 @@ HWC2::Error HWCDisplay::PrepareLayerStack(uint32_t *out_num_types, uint32_t *out
   }
 
   UpdateRefreshRate();
+  UpdateActiveConfig();
   DisplayError error = display_intf_->Prepare(&layer_stack_);
   if (error != kErrorNone) {
     if (error == kErrorShutDown) {
@@ -1280,6 +1317,7 @@ HWC2::Error HWCDisplay::PrepareLayerStack(uint32_t *out_num_types, uint32_t *out
     } else if (error == kErrorPermission) {
       WaitOnPreviousFence();
       MarkLayersForGPUBypass();
+      geometry_changes_on_doze_suspend_ |= geometry_changes_;
     } else {
       DLOGE("Prepare failed. Error = %d", error);
       // To prevent surfaceflinger infinite wait, flush the previous frame during Commit()
@@ -1561,10 +1599,11 @@ HWC2::Error HWCDisplay::PostCommitLayerStack(int32_t *out_retire_fence) {
       // release fences and discard fences from driver
       if (swap_interval_zero_ || layer->flags.single_buffer) {
         close(layer_buffer->release_fence_fd);
-      } else if (layer->composition != kCompositionGPU) {
-        hwc_layer->PushBackReleaseFence(layer_buffer->release_fence_fd);
       } else {
-        hwc_layer->PushBackReleaseFence(-1);
+        // It may so happen that layer gets marked to GPU & app layer gets queued
+        // to MDP for composition. In those scenarios, release fence of buffer should
+        // have mdp and gpu sync points merged.
+        hwc_layer->PushBackReleaseFence(layer_buffer->release_fence_fd);
       }
     } else {
       // In case of flush or display paused, we don't return an error to f/w, so it will
@@ -2261,11 +2300,16 @@ bool HWCDisplay::CanSkipValidate() {
     }
   }
 
+  if (!layer_set_.empty() && !display_intf_->CanSkipValidate()) {
+    DLOGV_IF(kTagClient, "Display needs validation %d", id_);
+    return false;
+  }
+
   return true;
 }
 
-HWC2::Error HWCDisplay::GetValidateDisplayOutput(uint32_t *out_num_types,
-                                                 uint32_t *out_num_requests) {
+HWC2::Error HWCDisplay::PresentAndOrGetValidateDisplayOutput(uint32_t *out_num_types,
+                                                             uint32_t *out_num_requests) {
   *out_num_types = UINT32(layer_changes_.size());
   *out_num_requests = UINT32(layer_requests_.size());
 
@@ -2359,6 +2403,20 @@ void HWCDisplay::WaitOnPreviousFence() {
       return;
     }
   }
+}
+
+void HWCDisplay::UpdateActiveConfig() {
+  if (!pending_config_) {
+    return;
+  }
+
+  DisplayError error = display_intf_->SetActiveConfig(pending_config_index_);
+  if (error != kErrorNone) {
+    DLOGI("Failed to set %d config", INT(pending_config_index_));
+  }
+
+  // Reset pending config.
+  pending_config_ = false;
 }
 
 }  // namespace sdm

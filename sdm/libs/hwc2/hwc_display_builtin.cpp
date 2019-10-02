@@ -244,7 +244,7 @@ HWC2::Error HWCDisplayBuiltIn::Validate(uint32_t *out_num_types, uint32_t *out_n
 
   if (layer_set_.empty()) {
     // Avoid flush for Command mode panel.
-    flush_ = !(IsDisplayCommandMode() && active_secure_sessions_[kSecureDisplay]);
+    flush_ = !client_connected_;
     validated_ = true;
     return status;
   }
@@ -290,6 +290,15 @@ HWC2::Error HWCDisplayBuiltIn::Present(int32_t *out_retire_fence) {
     if (error != kErrorNone) {
       DLOGE("Flush failed. Error = %d", error);
     }
+  } else if (commit_state_ == kInternalCommit) {
+    // Commit got triggered as part of validate.
+    // Just return fence.
+    *out_retire_fence = retire_fence_;
+    // Client closes this fence.
+    retire_fence_ = -1;
+    // Subsequent commits have to be normal. Reset state.
+    commit_state_ = kNormalCommit;
+    validate_state_ = kSkipValidate;
   } else {
     status = CommitLayerStack();
     if (status == HWC2::Error::None) {
@@ -874,13 +883,10 @@ DisplayError HWCDisplayBuiltIn::ControlIdlePowerCollapse(bool enable, bool synch
 }
 
 DisplayError HWCDisplayBuiltIn::SetDynamicDSIClock(uint64_t bitclk) {
-  {
-    SEQUENCE_WAIT_SCOPE_LOCK(HWCSession::locker_[type_]);
-    DisplayError error = display_intf_->SetDynamicDSIClock(bitclk);
-    if (error != kErrorNone) {
-      DLOGE(" failed: Clk: %llu Error: %d", bitclk, error);
-      return error;
-    }
+  DisplayError error = display_intf_->SetDynamicDSIClock(bitclk);
+  if (error != kErrorNone) {
+    DLOGE(" failed: Clk: %llu Error: %d", bitclk, error);
+    return error;
   }
 
   callbacks_->Refresh(id_);
@@ -890,7 +896,6 @@ DisplayError HWCDisplayBuiltIn::SetDynamicDSIClock(uint64_t bitclk) {
 }
 
 DisplayError HWCDisplayBuiltIn::GetDynamicDSIClock(uint64_t *bitclk) {
-  SEQUENCE_WAIT_SCOPE_LOCK(HWCSession::locker_[type_]);
   if (display_intf_) {
     return display_intf_->GetDynamicDSIClock(bitclk);
   }
@@ -914,6 +919,37 @@ HWC2::Error HWCDisplayBuiltIn::UpdateDisplayId(hwc2_display_t id) {
 HWC2::Error HWCDisplayBuiltIn::SetPendingRefresh() {
   pending_refresh_ = true;
   return HWC2::Error::None;
+}
+
+HWC2::Error HWCDisplayBuiltIn::PresentAndOrGetValidateDisplayOutput(uint32_t *out_num_types,
+                                                                    uint32_t *out_num_requests) {
+  *out_num_types = UINT32(layer_changes_.size());
+  *out_num_requests = UINT32(layer_requests_.size());
+
+  auto status = (*out_num_types > 0) ? HWC2::Error::HasChanges : HWC2::Error::None;
+  if (layer_stack_.block_on_fb) {
+    return status;
+  }
+
+  // If a display is in internal Validate state, PresentDisplay can be triggered
+  // if there is no dependency on GPU composed output in current draw cycle.
+  int retire_fence = -1;
+  auto result = Present(&retire_fence);
+  if (result != HWC2::Error::None) {
+    DLOGE("Commit failed: %d", result);
+    return status;
+  }
+
+  // Store retire fence as client isn't concerned about it.
+  retire_fence_ = retire_fence;
+  // Validate State resets to kSkipValidate as part of PostCommit.
+  // Restore it to kInternal Validate.
+  validate_state_ = kInternalValidate;
+  // As part of  PostCommit() commit state changes to NormalCommit.
+  // Change it to InternalCommit so that next commit will be skipped.
+  commit_state_ = kInternalCommit;
+
+  return status;
 }
 
 }  // namespace sdm
